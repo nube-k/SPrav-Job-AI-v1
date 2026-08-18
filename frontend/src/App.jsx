@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import axios from 'axios'
-import { Briefcase, LayoutDashboard, Database, Activity, Search, Send, Mail, CheckCircle, Settings as SettingsIcon, BarChart2, Target, Eye, Sun, Moon } from 'lucide-react'
+import { Briefcase, LayoutDashboard, Database, Activity, Search, Send, Mail, CheckCircle, Settings as SettingsIcon, BarChart2, Target, Eye, Sun, Moon, Calendar, Brain, BookOpen } from 'lucide-react'
 import ManualReview from './pages/ManualReview'
 import KnowledgeBaseEditor from './pages/KnowledgeBaseEditor'
 import Onboarding from './pages/Onboarding'
@@ -10,7 +10,11 @@ import SettingsPage from './pages/Settings'
 import AuthGate from './AuthGate'
 import HumanApply from './HumanApply'
 import Copilot from './Copilot'
+import GuideTour from './GuideTour'
 import JobDetailsModal from './JobDetailsModal'
+import RecruiterOutreach from './pages/RecruiterOutreach'
+import GatewayTracker from './pages/GatewayTracker'
+import PrepCenter from './pages/PrepCenter'
 import './index.css'
 
 const API_BASE = '/api'
@@ -169,6 +173,13 @@ function App() {
     }
   }
 
+  const clearDaemonError = async () => {
+    try {
+      await axios.post(`${API_BASE}/daemon/clear-error`)
+      fetchMetrics()
+    } catch (e) { console.error(e) }
+  }
+
 
 
   return (
@@ -199,7 +210,16 @@ function App() {
             <Target size={20} /> Application Scope
           </div>
           <div className={`nav-item ${activeTab === 'watchlist' ? 'active' : ''}`} onClick={() => setActiveTab('watchlist')}>
-            <Eye size={20} /> Company Watchlist
+            <Eye size={18} /> Watchlist / Careers Pages
+          </div>
+          <div className={`nav-item ${activeTab === 'recruiter' ? 'active' : ''}`} onClick={() => setActiveTab('recruiter')}>
+            <Target size={18} /> Recruiter Outreach
+          </div>
+          <div className={`nav-item ${activeTab === 'gateways' ? 'active' : ''}`} onClick={() => setActiveTab('gateways')}>
+            <Calendar size={18} /> Gateway Tests
+          </div>
+          <div className={`nav-item ${activeTab === 'prep' ? 'active' : ''}`} onClick={() => setActiveTab('prep')}>
+            <Brain size={18} /> Prep Center
           </div>
           <div className={`nav-item ${activeTab === 'config' ? 'active' : ''}`} onClick={() => setActiveTab('config')}>
             <SettingsIcon size={20} /> System Config
@@ -219,6 +239,18 @@ function App() {
 
       {/* Main Content Area */}
       <div className="main-content">
+        {metrics?.latest_error && (
+          <div style={{background: 'rgba(239, 68, 68, 0.2)', color: '#fca5a5', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem', border: '1px solid rgba(239, 68, 68, 0.3)', display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+             <div><strong>🚨 Daemon Error:</strong> {metrics.latest_error}</div>
+             <button onClick={clearDaemonError} style={{background: 'transparent', border: '1px solid #fca5a5', color: '#fca5a5', borderRadius: '4px', padding: '4px 8px', cursor: 'pointer', marginLeft: '1rem'}}>Dismiss</button>
+          </div>
+        )}
+        {metrics?.waiting_onboarding && (
+          <div style={{background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem', border: '1px solid rgba(245, 158, 11, 0.3)'}}>
+             <strong>⚠️ Action Required:</strong> {metrics.waiting_onboarding}
+          </div>
+        )}
+        
         {activeTab === 'home' && (
           <div className="fade-in">
             <h2>Command Center</h2>
@@ -452,6 +484,9 @@ function App() {
           </div>
         )}
 
+        {activeTab === 'gateways' && <GatewayTracker token={token} />}
+        {activeTab === 'prep' && <PrepCenter token={token} />}
+
         {activeTab === 'settings' && (
           <SettingsPage token={token} />
         )}
@@ -459,8 +494,13 @@ function App() {
         {activeTab === 'watchlist' && (
           <WatchlistManager token={token} />
         )}
+
+        {activeTab === 'recruiter' && (
+          <RecruiterOutreach token={token} />
+        )}
       </div>
 
+      <GuideTour currentTab={activeTab} />
       <Copilot token={token} currentTab={activeTab} />
 
       {selectedJobId && (

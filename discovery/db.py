@@ -3,7 +3,9 @@ import os
 import hashlib
 from datetime import date
 
-DB_PATH = "jobs.db"
+from engine.utils import get_data_dir
+import os
+DB_PATH = os.path.join(get_data_dir(), "jobs.db")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,6 +75,21 @@ def init_db():
 
     try:
         cursor.execute("ALTER TABLE jobs ADD COLUMN ats_score REAL DEFAULT 0.0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN warm_path_score INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN contacts TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN outcome TEXT DEFAULT 'pending'")
     except sqlite3.OperationalError:
         pass
 

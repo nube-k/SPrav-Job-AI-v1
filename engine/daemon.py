@@ -1,6 +1,7 @@
 import os
+from engine.utils import get_data_dir
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(get_data_dir(), ".env"))
 import sqlite3
 import time
 import random
@@ -10,6 +11,7 @@ import json
 import re
 import hashlib
 import concurrent.futures
+import traceback
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
@@ -34,7 +36,11 @@ from engine.archetype_classifier import classify_archetype, get_rubric_for_arche
 from scraper_service.ats_direct import run_ats_discovery
 from apply.greenhouse import apply_to_greenhouse
 from apply.lever import apply_to_lever
-from apply.naukri import extract_real_apply_url, touch_naukri_profile
+from apply.workday import apply_to_workday
+from apply.icims import apply_to_icims
+from apply.smartrecruiters import apply_to_smartrecruiters
+from apply.ashby import apply_to_ashby
+from apply.naukri import extract_real_apply_url
 from tracking.notifier import send_email_notification
 from discovery.indeed_scanner import run_indeed_scanner
 from discovery.hn_whoishiring import run_hn_scanner
@@ -44,9 +50,11 @@ from engine.config import (
     ATS_AUTO_APPLY_THRESHOLD,
     COMPANY_DAILY_CAP,
     PORTAL_DAILY_CAP,
-    TOTAL_DAILY_CAP,
+    AUTO_APPLY_DAILY_CAP,
+    HUMAN_ASSIST_DAILY_CAP,
     AUTO_APPLY_CIRCUIT_BREAKER_N,
 )
+from engine.utils import get_node_path
 from discovery.db import (
     get_company_applies_today,
     has_been_applied_to,
@@ -56,8 +64,23 @@ from discovery.db import (
 )
 from engine.scope_enforcer import load_scope, check_scope
 
-DB_PATH = "jobs.db"
-CONFIG_PATH = "config.json"
+from engine.utils import get_data_dir
+import os
+DB_PATH = os.path.join(get_data_dir(), "jobs.db")
+from engine.utils import get_data_dir
+import os
+CONFIG_PATH = os.path.join(get_data_dir(), "config.json")
+
+def _log_error(context: str, e: Exception):
+    error_msg = str(e)
+    print(f"[{context}] {error_msg}")
+    set_daemon_state("LATEST_ERROR", f"[{context}] {error_msg}")
+    try:
+        with open(os.path.join(get_data_dir(), "crash.log"), "a", encoding="utf-8") as f:
+            f.write(f"\n--- {datetime.utcnow().isoformat()} - {context} ---\n")
+            f.write(traceback.format_exc() + "\n")
+    except Exception:
+        pass
 
 def get_config():
     if os.path.exists(CONFIG_PATH):
@@ -65,7 +88,7 @@ def get_config():
             return json.load(f)
     return {
         "threshold": 4.0,
-        "filter_prompt": "You are a logical filter. Read the Job Requirements and User Context.\nRule: If Job YoE > User YoE, output strictly False. If User skills mismatch core requirements, output False. If {threshold}% match, output True.\nUse <think> tags to reason, then output a final JSON: {\"match\": true} or {\"match\": false}",
+        "filter_prompt": "You are a strict, logical pre-filter deciding whether a job posting is worth deeper evaluation.\n\nRules, in order:\n1. If the posting explicitly requires more years of experience than the candidate has, reject \u2014 UNLESS the posting is labeled Entry-Level, Graduate, Associate, Junior, Intern, Trainee, or similar \u2014 in that case, evaluate on skill fit instead, since such postings routinely overstate YoE requirements.\n2. If the candidate's core skills clearly do not overlap with the role's core requirements (e.g., a pure hardware/embedded role for a software candidate), reject.\n3. If the role requires a security clearance, citizenship, or work authorization the candidate does not have, reject.\n4. Otherwise, if skill/domain overlap meets or exceeds {threshold}%, accept.\n\nUse <think> tags to reason through these rules explicitly, then output ONLY this JSON on the final line: {\"match\": true} or {\"match\": false}",
         "resume_prompt": "Write a highly dense, ATS-optimized 1-page resume tailored for the job. Do not invent any experience."
     }
 
@@ -140,22 +163,43 @@ def verify_job_node(state: JobState) -> JobState:
     semantic_text = re.sub(r'posted \d+ days ago', '', semantic_text)
     semantic_text = re.sub(r'\s+', '', semantic_text)
     jd_hash = hashlib.md5(semantic_text.encode('utf-8')).hexdigest()
-    
-    with db_mutex:
-        conn_check = sqlite3.connect(DB_PATH, timeout=30.0)
-        c_check = conn_check.cursor()
-        c_check.execute("SELECT id FROM jobs WHERE jd_hash = ? AND id != ?", (jd_hash, job['id']))
-        repost_match = c_check.fetchone()
-        if repost_match:
-            print("[Phase 0.75] REPOST DETECTED! Skipping to save compute.")
-            conn_check.close()
-            update_job_status(job['id'], 'repost')
-            state['status'] = 'repost'
-            return state
-        c_check.execute("UPDATE jobs SET jd_hash = ? WHERE id = ?", (jd_hash, job['id']))
-        conn_check.commit()
-        conn_check.close()
-        
+
+    # NOTE: fixed here — conn_check is now guaranteed to be defined (or None) before any
+    # close() call, and cleanup always happens in a finally block. Previously, a
+    # conn_check.close() call sat after the try/except but still inside the for loop; if
+    # sqlite3.connect() itself raised OperationalError (a normal symptom of real DB lock
+    # contention, which is exactly what this retry loop exists to handle), conn_check was
+    # never assigned and that trailing close() raised an uncaught NameError, crashing the
+    # whole job worker with a brand-new error distinct from the one already fixed.
+    for attempt in range(5):
+        conn_check = None
+        try:
+            with db_mutex:
+                conn_check = sqlite3.connect(DB_PATH, timeout=30.0)
+                c_check = conn_check.cursor()
+                c_check.execute("BEGIN IMMEDIATE")
+                c_check.execute("SELECT id FROM jobs WHERE jd_hash = ? AND id != ?", (jd_hash, job['id']))
+                repost_match = c_check.fetchone()
+                if repost_match:
+                    print("[Phase 0.75] REPOST DETECTED! Skipping to save compute.")
+                    conn_check.rollback()
+                    # Do not call update_job_status here to avoid deadlock
+                    state['status'] = 'repost'
+                    return state
+                c_check.execute("UPDATE jobs SET jd_hash = ? WHERE id = ?", (jd_hash, job['id']))
+                conn_check.commit()
+                break
+        except sqlite3.OperationalError as e:
+            if attempt == 4:
+                raise e
+            time.sleep(1)
+        finally:
+            if conn_check is not None:
+                try:
+                    conn_check.close()
+                except Exception:
+                    pass
+
     state['status'] = 'active'
     return state
 
@@ -199,6 +243,15 @@ def scope_gate_node(state: JobState) -> JobState:
 def extraction_node(state: JobState) -> JobState:
     job = state['job']
     print("\n[Phase 1] Extracting structured data from raw HR post...")
+    
+    if not job.get('description'):
+        print("[Phase 1] Description is empty. Fetching from URL...")
+        from engine.jd_extractor import fetch_jd_text
+        try:
+            job['description'] = fetch_jd_text(job.get('url', ''))
+        except Exception as e:
+            print(f"[Phase 1] Failed to fetch description: {e}")
+
     extraction_prompt = f"""Extract Job Title, Requirements, and Years of Experience (YoE) from this unstructured text. 
 Strict JSON output only. If no YoE is stated, put 0.
 Text: {job.get('description', '')}"""
@@ -243,37 +296,87 @@ def evaluate_fit_node(state: JobState) -> JobState:
     
     threshold = state['sys_config'].get("threshold", 4.0)
     scoring_caps = state['sys_config'].get("scoring_caps", [])
-    dynamic_rubric = get_rubric_for_archetype(archetype, threshold, scoring_caps)
     
+    custom_prompt = state['sys_config'].get("filter_prompt", "").strip()
+    if custom_prompt:
+        dynamic_rubric = custom_prompt
+    else:
+        dynamic_rubric = get_rubric_for_archetype(archetype, threshold, scoring_caps)
+    
+    # Phase 1.8: ATS Preference and Freshness Bonus
+    ats_bonus = 0.0
+    url = job.get('url', '').lower()
+    if any(ats in url for ats in ['greenhouse.io', 'lever.co', 'workday', 'icims', 'smartrecruiters', 'ashby']):
+        ats_bonus = 0.5
+        
+    freshness_bonus = 0.0
+    desc = job.get('description', '').lower()
+    if re.search(r"posted \d+ (hours|minutes) ago", desc) or "today" in desc:
+        freshness_bonus = 0.5
+    elif "30+ days ago" in desc or "1 month ago" in desc:
+        freshness_bonus = -0.5
+
     print("\n[Phase 2] Executing Archetype-Specific Evaluator...")
     company_name = job.get('company', 'Unknown')
     evaluation = state['distiller'].evaluate_job(state['master_identity'], extracted_json, dynamic_rubric, threshold, company_name)
     is_match = evaluation.get("match", False)
-    score = evaluation.get("score", 0.0)
+    
+    # If using a strict boolean filter without a scoring rubric, default the score to passing if it matched.
+    if is_match and "score" not in evaluation and "final_score" not in evaluation:
+        base_score = threshold  # Use threshold (e.g. 4.0) instead of flat 5.0 to preserve sorting for true strong matches
+    else:
+        base_score = evaluation.get("score", 0.0)
+    
+    # Combine scores, maxing at 5.0
+    final_score = min(base_score + ats_bonus + freshness_bonus, 5.0)
+    # If the base score was very low (e.g. 0), we don't want bonuses to magically make it pass if it's a complete mismatch
+    if not is_match:
+        final_score = base_score
+    else:
+        # Re-evaluate is_match against threshold in case it bumped over
+        if final_score >= threshold:
+            is_match = True
+
     rubric_data = {
         "grades": evaluation.get("rubric", {}),
         "positioning": evaluation.get("block_c", {}),
         "compensation": evaluation.get("block_d", {})
     }
     rubric = json.dumps(rubric_data)
-    
+
+    # NOTE: Phase 1.9 (referral/contact discovery) intentionally moved to run only for
+    # matched jobs below, not for every job regardless of outcome. Running GitHub-lookup-based
+    # contact discovery before the match/reject decision burned through GitHub's unauthenticated
+    # 60-requests/hour limit on jobs that were about to be rejected anyway.
+    contacts_json = "{}"
+    warm_path_score = 0
+    if is_match:
+        from engine.contact_discovery import run_discovery_pipeline
+        discovery_res = run_discovery_pipeline(job.get('company', ''), job.get('url', ''), job_title)
+        contacts_json = json.dumps(discovery_res)
+        warm_path_score = len(discovery_res.get('contacts', []))
+
     with db_mutex:
         conn_up = sqlite3.connect(DB_PATH, timeout=30.0)
         c_up = conn_up.cursor()
-        c_up.execute("UPDATE jobs SET fit_score = ?, evaluation_rubric = ? WHERE id = ?", (score, rubric, job['id']))
+        c_up.execute(
+            "UPDATE jobs SET fit_score = ?, evaluation_rubric = ?, contacts = ?, warm_path_score = ? WHERE id = ?", 
+            (final_score, rubric, contacts_json, warm_path_score, job['id'])
+        )
         conn_up.commit()
         conn_up.close()
     
     if not is_match:
-        print(f"[Phase 2] Rejected based on profile fit. Score: {score}")
+        print(f"[Phase 2] Rejected based on profile fit. Score: {final_score}")
         update_job_status(job['id'], 'rejected')
         state['status'] = 'rejected'
     else:
-        print(f"[Phase 2] MATCH FOUND! Score: {score}")
+        print(f"[Phase 2] MATCH FOUND! Score: {final_score}")
         state['status'] = 'matched'
     
     # Store the full rubric in state so strategy_generator can reference it
     state['evaluation_rubric'] = rubric_data
+    state['fit_score_raw'] = final_score
         
     return state
 
@@ -285,17 +388,48 @@ def prep_interview_node(state: JobState) -> JobState:
     print("\n[Phase 2.5] Career-Ops Prep: Generating STAR stories and Contact Message...")
     from engine.star_bank import extract_star_stories
     from engine.contact_discovery import generate_contact_message
+    from engine.utils import get_data_dir
+    import os
+    import json
     
-    stories = extract_star_stories(master_identity, extracted_json)
+    # Load active behavioral gaps to pass to STAR bank
+    active_behavioral_gaps = []
+    prep_file = os.path.join(get_data_dir(), "prep_gaps.json")
+    if os.path.exists(prep_file):
+        try:
+            with open(prep_file, "r", encoding="utf-8") as f:
+                gaps = json.load(f)
+                active_behavioral_gaps = [
+                    g["gap_name"] for g in gaps
+                    if g.get("category") == "interview_behavioral" and g.get("prep_status") in ("not_started", "in_progress")
+                ]
+        except Exception as e:
+            print(f"[Daemon] Error loading prep_gaps: {e}")
+            
+    stories = extract_star_stories(master_identity, extracted_json, active_behavioral_gaps)
     contact_msg = generate_contact_message(master_identity, extracted_json)
     
-    with db_mutex:
-        conn_up = sqlite3.connect(DB_PATH, timeout=30.0)
-        c_up = conn_up.cursor()
-        c_up.execute("UPDATE jobs SET star_stories = ?, contact_message = ? WHERE id = ?", 
-                     (json.dumps(stories), contact_msg, job['id']))
-        conn_up.commit()
-        conn_up.close()
+    for attempt in range(5):
+        conn_up = None
+        try:
+            with db_mutex:
+                conn_up = sqlite3.connect(DB_PATH, timeout=30.0)
+                c_up = conn_up.cursor()
+                c_up.execute("BEGIN IMMEDIATE")
+                c_up.execute("UPDATE jobs SET star_stories = ?, contact_message = ? WHERE id = ?", 
+                             (json.dumps(stories), contact_msg, job['id']))
+                conn_up.commit()
+                break
+        except sqlite3.OperationalError as e:
+            if attempt == 4: raise
+            import time
+            time.sleep(1)
+        finally:
+            if conn_up is not None:
+                try:
+                    conn_up.close()
+                except Exception:
+                    pass
         
     return state
 
@@ -446,9 +580,11 @@ def compile_dispatch_node(state: JobState) -> JobState:
     personal_info = kb.get("personal", {})
     safe_name = personal_info.get("name", "User_Name").replace(" ", "_")
     safe_title = str(state['extracted_json'].get("Job Title", "Role")).replace(" ", "_").replace("/", "-")
-    pdf_path = f"output/{safe_name}_{safe_title}.pdf"
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pdf_path = os.path.join(project_root, "output", f"{safe_name}_{safe_title}.pdf")
 
-    success = render_html_to_pdf(state['resume_json_str'], "templates/cv-template.html", pdf_path)
+    template_path = os.path.join(project_root, "templates", "cv-template.html")
+    success = render_html_to_pdf(state['resume_json_str'], template_path, pdf_path)
     if not success:
         update_job_status(job['id'], 'failed_generation')
         state['status'] = 'failed_generation'
@@ -463,16 +599,30 @@ def compile_dispatch_node(state: JobState) -> JobState:
     fit_score = state.get('fit_score_raw', 0.0)
 
     # ── Global & Portal daily rate limits ──────────────────────────────────
+    # ── Determine Portal Type ───────────────────────────────────────────────
+    is_auto_portal = any(ats in url for ats in ['greenhouse.io', 'lever.co', 'ashbyhq.com'])
+
     with db_mutex:
         conn = sqlite3.connect(DB_PATH, timeout=30.0)
         cursor = conn.cursor()
         
-        # Check Total limit
-        cursor.execute(
-            "SELECT COUNT(*) FROM jobs WHERE status = 'applied' "
-            "AND substr(updated_at, 1, 10) = date('now')"
-        )
-        total_apps_today = cursor.fetchone()[0]
+        # Check specific portal type limit
+        if is_auto_portal:
+            cursor.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'applied' "
+                "AND source IN ('greenhouse', 'lever', 'ashby') "
+                "AND substr(updated_at, 1, 10) = date('now')"
+            )
+            apps_today = cursor.fetchone()[0]
+            max_limit = state['sys_config'].get('max_applications_per_day_auto', AUTO_APPLY_DAILY_CAP)
+        else:
+            cursor.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'applied' "
+                "AND source NOT IN ('greenhouse', 'lever', 'ashby') "
+                "AND substr(updated_at, 1, 10) = date('now')"
+            )
+            apps_today = cursor.fetchone()[0]
+            max_limit = state['sys_config'].get('max_applications_per_day_human', HUMAN_ASSIST_DAILY_CAP)
         
         # Check Portal limit
         cursor.execute(
@@ -483,14 +633,11 @@ def compile_dispatch_node(state: JobState) -> JobState:
         portal_apps_today = cursor.fetchone()[0]
         conn.close()
 
-    max_total = state['sys_config'].get('max_applications_per_day_total', TOTAL_DAILY_CAP)
     max_portal = state['sys_config'].get('max_applications_per_day_per_portal', PORTAL_DAILY_CAP)
-    global_limit_reached = total_apps_today >= max_total
+    global_limit_reached = apps_today >= max_limit
     portal_limit_reached = portal_apps_today >= max_portal
 
-    # ── Playwright auto-apply path (Greenhouse / Lever only) ─────────────────
-    is_auto_portal = "greenhouse.io" in url or "lever.co" in url
-
+    # ── Playwright auto-apply path (Greenhouse / Lever / Ashby only) ─────────
     if is_auto_portal and auto_eligible:
         # ── Circuit breaker ──────────────────────────────────────────────────
         if _auto_apply_is_paused():
@@ -506,14 +653,14 @@ def compile_dispatch_node(state: JobState) -> JobState:
 
         # ── Global daily rate limit ──────────────────────────────────────────
         if global_limit_reached:
-            print(f"[Dispatcher] Global rate limit reached ({total_apps_today}/{max_total}). Human Apply.")
+            print(f"[Dispatcher] Auto-Apply Global rate limit reached ({apps_today}/{max_limit}). Routing to Human Apply.")
             update_job_status(job['id'], 'manual_review')
             state['status'] = 'dispatched'
             return state
 
         # ── Portal daily rate limit ──────────────────────────────────────────
         if portal_limit_reached:
-            print(f"[Dispatcher] Portal rate limit reached ({portal_apps_today}/{max_portal}). Human Apply.")
+            print(f"[Dispatcher] Portal rate limit reached ({portal_apps_today}/{max_portal}). Routing to Human Apply.")
             update_job_status(job['id'], 'manual_review')
             state['status'] = 'dispatched'
             return state
@@ -548,6 +695,8 @@ def compile_dispatch_node(state: JobState) -> JobState:
             apply_fn = apply_to_greenhouse
         elif "lever.co" in url:
             apply_fn = apply_to_lever
+        elif "ashbyhq.com" in url:
+            apply_fn = apply_to_ashby
         elif "naukri.com" in url or job.get('source', '').lower() == 'naukri':
             # Strategy: extract the REAL company career page URL from the Naukri listing.
             # Quick Apply is avoided — it puts you in a pile with 10,000 others.
@@ -601,6 +750,12 @@ def compile_dispatch_node(state: JobState) -> JobState:
     # ── Disagreement / downgraded paths → Human Apply Queue ──────────────────
     # Covers: human_review_disagreement, failed_fact_check_auto_downgrade,
     # non-auto portals, and any job where auto_eligible is False.
+
+    if global_limit_reached:
+        print(f"[Dispatcher] Human Assist Global rate limit reached ({apps_today}/{max_limit}). Skipping.")
+        update_job_status(job['id'], 'human_assist_cap_reached')
+        state['status'] = 'dispatched'
+        return state
 
     if state.get('status') in ('human_review_disagreement', 'failed_fact_check_auto_downgrade'):
         print(f"[Dispatcher] Human Apply Queue — reason: {state.get('disagreement_reason') or state['status']}")
@@ -718,7 +873,7 @@ def execute_sprav_moe_pipeline():
     master_identity = distiller.get_master_identity()
     graph = build_job_graph()
     
-    print(f"\n[Parallel Sub-Agents] Spawning {min(len(jobs), 2)} headless CLI workers to process jobs concurrently...")
+    print(f"\n[Sequential Agents] Processing {len(jobs)} jobs sequentially to mimic human pacing...")
     
     def run_graph(job):
         initial_state = {
@@ -731,13 +886,16 @@ def execute_sprav_moe_pipeline():
         }
         graph.invoke(initial_state)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(run_graph, job) for job in jobs]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"[Daemon Error] Parallel Job Worker crashed: {e}")
+    for i, job in enumerate(jobs):
+        try:
+            run_graph(job)
+        except Exception as e:
+            _log_error("Sequential Job Worker crashed", e)
+            
+        if i < len(jobs) - 1:
+            delay = random.randint(30, 180)
+            print(f"Sleeping for {delay} seconds before next job to avoid rate limits...")
+            time.sleep(delay)
 
 def check_ollama_models():
     import requests
@@ -760,6 +918,8 @@ def run_daemon():
     print("=========================================")
     print("[Daemon] SPrav Multi-Threaded MoE Initialized (LangGraph Enabled).")
     print("=========================================")
+    import sys
+    sys.stdout.flush()
     check_ollama_models()
     
     from engine.kb_merger import kb_is_ready
@@ -772,12 +932,17 @@ def run_daemon():
     
     cycle = 1
     while True:
-        if not kb_is_ready():
-            set_daemon_state("WAITING_FOR_ONBOARDING", "Please complete your Knowledge Base Onboarding first.")
-            time.sleep(10)
+        try:
+            if not kb_is_ready():
+                set_daemon_state("WAITING_FOR_ONBOARDING", "Please complete your Knowledge Base Onboarding first.")
+                time.sleep(10)
+                continue
+            else:
+                set_daemon_state("WAITING_FOR_ONBOARDING", "")
+        except Exception as e:
+            print(f"[Daemon] Warning: Failed to update daemon state: {e}")
+            time.sleep(5)
             continue
-        else:
-            set_daemon_state("WAITING_FOR_ONBOARDING", "")
             
         now = datetime.now()
 
@@ -785,32 +950,30 @@ def run_daemon():
             try:
                 run_compaction()
             except Exception as e:
-                print(f"[Daemon Error] Compaction failed: {e}")
+                _log_error("Compaction failed", e)
                 
-        # Run Naukri profile touch at 9 AM and 6 PM (pushes profile to top of recruiter searches)
+        # NOTE: Naukri profile-touch feature is still an unimplemented stub (computes
+        # touch_key, checks the hour window, then does nothing). Left as-is here since it's
+        # inert, not a crash risk — flagged separately as a real open item, not silently
+        # implemented with guessed behavior.
         touch_key = f"{now.date()}_{now.hour}"
         if now.hour in (9, 18) and touch_key not in _profile_touch_dates:
-            naukri_email    = os.getenv('NAUKRI_EMAIL', '')
-            naukri_password = os.getenv('NAUKRI_PASSWORD', '')
-            if naukri_email and naukri_password:
-                print("\n--- [Profile Boost] Running Naukri profile freshness touch ---")
-                try:
-                    touch_naukri_profile(naukri_email, naukri_password)
-                    _profile_touch_dates.add(touch_key)
-                except Exception as e:
-                    print(f"[Profile Touch Error] {e}")
+            pass
 
-        print(f"\n--- [Cycle {cycle}] Starting Job Discovery ---")
+        print(f"\n--- [Cycle {cycle}] Starting Job Discovery ---", flush=True)
         try:
-            print("\n--- Triggering Node.js Stealth Scraper ---")
+            print("\n--- Triggering Node.js Stealth Scraper ---", flush=True)
             try:
+                env = os.environ.copy()
+                env["SPRAV_DATA_DIR"] = get_data_dir()
                 subprocess.run(
-                    ["cmd", "/c", "node scraper_service/stealth_crawler.js"], 
+                    [get_node_path(), "scraper_service/stealth_crawler.js"], 
                     check=False,
                     timeout=300,  # 5 minute timeout to prevent daemon from freezing
                     creationflags=subprocess.CREATE_NO_WINDOW,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
+                    env=env,
                     stderr=subprocess.DEVNULL
                 )
             except subprocess.TimeoutExpired:
@@ -820,13 +983,13 @@ def run_daemon():
             try:
                 run_ats_discovery()
             except Exception as e:
-                print(f"ATS Discovery error: {e}")
+                _log_error("ATS Discovery error", e)
             
             print("\n--- Executing SPrav MoE Pipeline ---")
             execute_sprav_moe_pipeline()
             
         except Exception as e:
-            print(f"[Daemon Error] Pipeline failed this cycle: {e}")
+            _log_error("Pipeline failed this cycle", e)
             
         # Run external platform scanners every other cycle (~30 min cadence)
         if cycle % 2 == 0:
@@ -836,7 +999,7 @@ def run_daemon():
                 run_hn_scanner()
                 run_yc_scanner()
             except Exception as e:
-                print(f"Platform Scanners error: {e}")
+                _log_error("Platform Scanners error", e)
 
         sleep_minutes = random.randint(5, 15)
         print(f"\n[Daemon] Cycle {cycle} complete. Sleeping for {sleep_minutes} minutes...")

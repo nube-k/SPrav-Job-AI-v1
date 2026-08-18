@@ -11,7 +11,9 @@ puppeteer.use(StealthPlugin());
 function getDynamicTargets() {
     let targets = [];
     try {
-        const scopeStr = fs.readFileSync('knowledge_base/scope.json', 'utf8');
+        const path = require('path');
+        const scopePath = path.join(process.env.SPRAV_DATA_DIR || '.', 'knowledge_base', 'scope.json');
+        const scopeStr = fs.readFileSync(scopePath, 'utf8');
         const scope = JSON.parse(scopeStr);
         
         const activeRoles = (scope.roles || [])
@@ -35,7 +37,17 @@ function getDynamicTargets() {
             for (const loc of sampleLocs) {
                 const q = encodeURIComponent(role);
                 const l = encodeURIComponent(loc);
-                targets.push({ name: "Indeed", url: `https://www.indeed.co.in/jobs?q=${q}&l=${l}` });
+                
+                // Dynamically determine Indeed domain based on location
+                const locLower = loc.toLowerCase();
+                let indeedDomain = "www.indeed.com";
+                if (locLower.includes("india")) indeedDomain = "in.indeed.com";
+                else if (locLower.includes("uk") || locLower.includes("united kingdom")) indeedDomain = "uk.indeed.com";
+                else if (locLower.includes("canada")) indeedDomain = "ca.indeed.com";
+                else if (locLower.includes("australia")) indeedDomain = "au.indeed.com";
+                else if (locLower.includes("germany")) indeedDomain = "de.indeed.com";
+
+                // targets.push({ name: "Indeed", url: `https://${indeedDomain}/jobs?q=${q}&l=${l}` });
                 
                 // Wellfound uses role/xxx format
                 const slug = role.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -45,7 +57,6 @@ function getDynamicTargets() {
     } catch (e) {
         console.error("[Node Scraper] Could not load scope.json, falling back to defaults.", e);
         targets = [
-            { name: "Indeed", url: "https://www.indeed.co.in/jobs?q=Software+Engineer&l=Remote" },
             { name: "Wellfound", url: "https://wellfound.com/role/software-engineer" }
         ];
     }
@@ -67,7 +78,7 @@ async function scrapePlatform(browser, target) {
     await page.setViewport({ width: 1280 + Math.floor(Math.random() * 100), height: 800 + Math.floor(Math.random() * 100) });
     
     try {
-        await page.goto(target.url, { waitUntil: 'networkidle2', timeout: 60000 });
+        await page.goto(target.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
         
         console.log(`[Node Scraper] Performing human-like scrolling on ${target.name}...`);
         for(let i=0; i<3; i++) {
@@ -81,7 +92,7 @@ async function scrapePlatform(browser, target) {
         const jobs = await page.evaluate(() => {
             const results = [];
             // Generic extraction strategy for HR posts and job cards
-            const cards = document.querySelectorAll('li, .job-card, .base-card, .result-card');
+            const cards = document.querySelectorAll('li, .job-card, .base-card, .result-card, [data-test="JobListing"], [class*="styles_component"]');
             cards.forEach(card => {
                 const text = card.innerText.trim();
                 const links = Array.from(card.querySelectorAll('a')).map(a => a.href);
@@ -96,6 +107,8 @@ async function scrapePlatform(browser, target) {
             return results;
         });
         
+        console.log(`[Node Scraper] Scraped ${jobs.length} items from ${target.name}. Preview: ${jobs.length > 0 ? jobs[0].raw_text.substring(0, 100) : 'None'}`);
+        await page.screenshot({path: 'wellfound_test.jpg'});
         await page.close();
         
         const formattedJobs = jobs.map(j => ({
